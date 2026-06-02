@@ -93,4 +93,8 @@ impl BpfOps for MockBpf {
     fn tail_trace_pipe(&self, _n: usize) -> Result<()> {
         Ok(())
     }
+
+    fn allowlist_add_prefix(&self, _pinned: &str, _prefix: &str) -> Result<()> {
+        Ok(())
+    }
 }

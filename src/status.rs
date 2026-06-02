@@ -15,6 +15,10 @@
 //! ```
 //!
 //! Unloaded: `{"loaded": false}`.
+//!
+//! warden-policy extension: an additive `"profile"` field is included in the
+//! loaded case. Absent ⇒ treat as `"tight"` (compiled defaults only). The
+//! existing keys are untouched so warden-home golden tests still pass.
 
 #![allow(clippy::print_stdout)] // CLI: stdout is intentional
 
@@ -27,15 +31,37 @@ use crate::bpf::{BpfOps, PINNED_MAP_PIDS, PINNED_MAP_STATS};
 ///
 /// `pids_raw` and `stats_raw` are the stdout of `bpftool -j map dump pinned …`.
 /// An empty string or invalid JSON is treated as an empty map.
+///
+/// `profile` is the name of the currently-loaded policy profile. Pass `None`
+/// to omit the field (back-compat) or `Some("tight")` for the compiled default.
 #[must_use]
 pub fn assemble_status(pids_raw: &str, stats_raw: &str) -> Value {
+    assemble_status_with_profile(pids_raw, stats_raw, None)
+}
+
+/// Assemble the status JSON, including an optional `"profile"` field.
+///
+/// This is the warden-policy-aware variant. The additive `"profile"` field is
+/// included when `profile` is `Some`; otherwise the output is identical to
+/// [`assemble_status`] (back-compat with warden-home's golden test).
+#[must_use]
+#[allow(clippy::option_if_let_else)] // pids/stats must be computed before the conditional branch
+pub fn assemble_status_with_profile(pids_raw: &str, stats_raw: &str, profile: Option<&str>) -> Value {
     let pids = parse_pids(pids_raw);
     let stats = parse_stats(stats_raw);
-    json!({
-        "loaded": true,
-        "protected_pids": pids,
-        "stats": stats,
-    })
+    match profile {
+        Some(p) => json!({
+            "loaded": true,
+            "protected_pids": pids,
+            "stats": stats,
+            "profile": p,
+        }),
+        None => json!({
+            "loaded": true,
+            "protected_pids": pids,
+            "stats": stats,
+        }),
+    }
 }
 
 /// Parse the PIDs map dump into a sorted list of integers.
@@ -145,5 +171,28 @@ mod tests {
         let out = assemble_status("", "");
         assert_eq!(out["loaded"], json!(true));
         assert_eq!(out["protected_pids"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// AC7: assemble_status (no profile arg) does NOT include a "profile" field
+    /// — back-compat with warden-home golden test.
+    #[test]
+    fn test_ac7_backcompat_no_profile_field() {
+        let out = assemble_status("[]", "[]");
+        assert!(out.get("profile").is_none(), "profile field absent in back-compat output");
+    }
+
+    /// AC7: assemble_status_with_profile adds the "profile" field when Some.
+    #[test]
+    fn test_ac7_with_profile_field_present() {
+        let out = assemble_status_with_profile("[]", "[]", Some("workspace"));
+        assert_eq!(out["profile"], "workspace");
+    }
+
+    /// assemble_status_with_profile(None) matches assemble_status output.
+    #[test]
+    fn test_with_profile_none_matches_base() {
+        let base = assemble_status("[]", "[]");
+        let extended = assemble_status_with_profile("[]", "[]", None);
+        assert_eq!(base, extended);
     }
 }
