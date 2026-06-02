@@ -44,6 +44,7 @@ impl BpfOps for TogglingMock {
     fn map_delete(&self, _: &str, _: &[String]) -> Result<()> { Ok(()) }
     fn map_dump_json(&self, _: &str) -> String { String::new() }
     fn tail_trace_pipe(&self, _: usize) -> Result<()> { Ok(()) }
+    fn allowlist_add_prefix(&self, _: &str, _: &str) -> Result<()> { Ok(()) }
 }
 
 #[test]
@@ -51,11 +52,11 @@ fn test_load_idempotent() {
     // Start: already loaded
     let mock = TogglingMock::new(true);
     // First load call: already loaded, should NOT call load_prog
-    cmd_load(&mock).expect("cmd_load 1");
+    cmd_load(&mock, None).expect("cmd_load 1");
     assert_eq!(mock.load_called.get(), 0, "load_prog should not be called when already loaded");
 
     // Second load call: still already loaded
-    cmd_load(&mock).expect("cmd_load 2");
+    cmd_load(&mock, None).expect("cmd_load 2");
     assert_eq!(mock.load_called.get(), 0, "load_prog should still not be called");
 }
 
@@ -76,7 +77,7 @@ fn test_unload_idempotent() {
 fn test_load_then_unload() {
     // Start: not loaded, perform load then unload
     let mock = TogglingMock::new(false);
-    cmd_load(&mock).expect("load");
+    cmd_load(&mock, None).expect("load");
     assert!(mock.loaded.get(), "should be loaded after cmd_load");
     assert_eq!(mock.load_called.get(), 1);
 

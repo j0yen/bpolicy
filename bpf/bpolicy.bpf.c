@@ -12,12 +12,26 @@
 //   A future revision could add an inode_create hook with dentry-chain
 //   walking to prevent the touch entirely.
 //
-// Allow list (prefix match on the first few bytes of d_path):
+// Compiled defaults (path_allowed_defaults) — prefix match:
 //   /tmp/        — writable scratch space
 //   /dev/null    — discarding writes
 //   /dev/tty     — terminal output
 //   /dev/std{in,out,err} — already represented by fd dups
+//   /dev/pts/    — pseudo-terminal
 //   /proc/self/  — self-introspection
+//
+// Dynamic allowlist (allowlist map) — prefix match from policy profiles:
+//   Populated by userspace via `bpolicy load --profile <name>`.
+//   Keys are struct allowlist_key { u8 len; char data[255]; }
+//   Value is u8 (presence marker; value is ignored, only key matters).
+//
+// Prefix match spec (identical in BPF and src/policy.rs):
+//   Prefix P matches path T iff T == P  OR
+//   T starts_with(P) AND (len(T) == len(P) OR T[len(P)] == '/').
+//   This prevents /home/jsy/s from matching /home/jsy/sec.
+//
+// Userspace mirror: src/policy.rs:prefix_matches / is_allowed.
+// Any change to this spec MUST be reflected in policy.rs, and vice-versa.
 //
 // Compile:  clang -O2 -g -target bpf -I. -c bpolicy.bpf.c -o bpolicy.bpf.o
 // Load:     sudo bpftool prog loadall bpolicy.bpf.o /sys/fs/bpf/bpolicy autoattach
@@ -33,6 +47,10 @@ char LICENSE[] SEC("license") = "GPL";
 #define FMODE_WRITE 0x2
 #define EPERM 1
 
+// Maximum path prefix length stored in the allowlist map.
+// Matches MAX_PREFIX_LEN in src/bpf.rs.
+#define ALLOWLIST_MAX_PREFIX 255
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 8192);
@@ -47,6 +65,22 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
+
+// Dynamic allowlist map: keyed by path prefix structs.
+// Key: { u8 len; char data[ALLOWLIST_MAX_PREFIX]; } (256 bytes total)
+// Value: u8 presence marker.
+// Populated by `bpolicy load --profile <name>` after loadall.
+struct allowlist_key {
+    __u8  len;
+    char  data[ALLOWLIST_MAX_PREFIX];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, struct allowlist_key);
+    __type(value, __u8);
+} allowlist SEC(".maps");
 
 // stat indices
 #define S_CHECKED   0
@@ -81,7 +115,10 @@ int BPF_PROG(on_exit, struct task_struct *p)
     return 0;
 }
 
-static __always_inline int path_allowed(const char *p)
+// path_allowed_defaults: compiled always-allowed prefixes.
+// Spec cross-reference: src/policy.rs:COMPILED_DEFAULTS + is_default_allowed.
+// Any change here MUST be reflected in policy.rs COMPILED_DEFAULTS.
+static __always_inline int path_allowed_defaults(const char *p)
 {
     // /tmp/
     if (p[0] == '/' && p[1] == 't' && p[2] == 'm' && p[3] == 'p' && p[4] == '/')
@@ -96,6 +133,65 @@ static __always_inline int path_allowed(const char *p)
     if (p[0] == '/' && p[1] == 'p' && p[2] == 'r' && p[3] == 'o' && p[4] == 'c' &&
         p[5] == '/' && p[6] == 's' && p[7] == 'e' && p[8] == 'l' && p[9] == 'f' && p[10] == '/')
         return 1;
+    return 0;
+}
+
+// path_allowed_dynamic: check the dynamic allowlist map for a prefix match.
+//
+// Prefix match rule (mirrors src/policy.rs:prefix_matches):
+//   Prefix P (length plen) matches path T iff:
+//     T[0..plen] == P  AND  (T[plen] == '\0' OR T[plen] == '/').
+//
+// We iterate over all entries in the allowlist map using bpf_for_each_map_elem,
+// but that helper requires a BTF-annotated callback and is only available
+// on kernel 5.13+. Instead, we use a pragmatic approach: the userspace loader
+// ensures prefixes end with '/' (for directories) or are exact paths, so we
+// perform a bounded linear prefix comparison for each entry using a per-entry
+// hash lookup strategy.
+//
+// Implementation note: full iteration over a HASH map in BPF without
+// bpf_for_each_map_elem is not possible. We use a different approach:
+// we check the path against a sampled key reconstruction. Since the exact
+// prefix for the path cannot be enumerated in-kernel without iteration,
+// we reconstruct candidate prefix keys from the resolved path itself
+// (all prefix substrings up to MAX_PREFIX_LEN) and look each up in the
+// hash map. This is O(path_len) hash lookups — bounded and cheap.
+//
+// Cost bound: path is max 256 bytes; we check up to 256 keys of 256 bytes
+// each. In practice paths have few '/' components, so the loop exits early
+// on the first separator match. Documented per PRD note on cost.
+static __always_inline int path_allowed_dynamic(const char *path, int pathlen)
+{
+    struct allowlist_key k = {};
+    int i;
+
+    // Walk the path, checking each prefix ending at a '/' boundary or end-of-string.
+    // We cap at ALLOWLIST_MAX_PREFIX iterations to satisfy the BPF verifier.
+    #pragma unroll
+    for (i = 1; i <= ALLOWLIST_MAX_PREFIX; i++) {
+        if (i > pathlen)
+            break;
+
+        char c = path[i];
+        // Check at '/' boundaries and at end-of-string.
+        if (c != '/' && c != '\0')
+            continue;
+
+        // Build a candidate key: prefix = path[0..i]
+        k.len = (__u8)i;
+        // Copy path[0..i] into k.data (bounded copy, verifier-safe)
+        #pragma unroll
+        for (int j = 0; j < ALLOWLIST_MAX_PREFIX; j++) {
+            if (j < i)
+                k.data[j] = path[j];
+            else
+                k.data[j] = 0;
+        }
+
+        __u8 *hit = bpf_map_lookup_elem(&allowlist, &k);
+        if (hit)
+            return 1;
+    }
     return 0;
 }
 
@@ -123,7 +219,17 @@ int BPF_PROG(file_open_check, struct file *file, int ret)
         return 0;
     }
 
-    if (path_allowed(buf)) {
+    // Step 1: compiled always-allowed defaults (path_allowed_defaults).
+    // Spec cross-reference: src/policy.rs:is_default_allowed
+    if (path_allowed_defaults(buf)) {
+        bump(S_ALLOWED);
+        return 0;
+    }
+
+    // Step 2: dynamic allowlist from policy profile (path_allowed_dynamic).
+    // Spec cross-reference: src/policy.rs:is_allowed
+    int plen = (int)err; // bpf_d_path returns length on success
+    if (path_allowed_dynamic(buf, plen)) {
         bump(S_ALLOWED);
         return 0;
     }

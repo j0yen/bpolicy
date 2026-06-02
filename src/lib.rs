@@ -2,4 +2,5 @@
 
 pub mod bpf;
 pub mod pids;
+pub mod policy;
 pub mod status;
