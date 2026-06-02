@@ -1,0 +1,19 @@
+{
+  "schema": "autobuilder.owner_map.v1",
+  "paths": {
+    "src/main.rs": "cli-dispatch",
+    "src/lib.rs": "cli-dispatch",
+    "src/bpf.rs": "bpf-ops",
+    "src/pids.rs": "pid-encoding",
+    "src/status.rs": "status-json",
+    "tests/acceptance_help.rs": "ac1-ac6",
+    "tests/acceptance_status_shape.rs": "ac2-ac3",
+    "tests/acceptance_pidkey.rs": "ac4",
+    "tests/acceptance_idempotent.rs": "ac5",
+    "tests/mocks/ac8.rs": "ac8-deferred",
+    "bpf/bpolicy.bpf.c": "bpf-source-vendored",
+    "bpf/vmlinux.h": "bpf-source-vendored",
+    "bpf/build.sh": "bpf-build",
+    "reference/bpolicy.py": "reference-python"
+  }
+}

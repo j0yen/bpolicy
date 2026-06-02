@@ -1,0 +1,13 @@
+{
+  "schema": "autobuilder.test_map.v1",
+  "ac_to_tests": {
+    "AC1": ["tests/acceptance_help.rs::test_help_lists_six_subcommands"],
+    "AC2": ["tests/acceptance_status_shape.rs::test_status_not_loaded_json"],
+    "AC3": ["tests/acceptance_status_shape.rs::test_status_loaded_shape", "tests/acceptance_status_shape.rs::test_status_loaded_empty_maps"],
+    "AC4": ["tests/acceptance_pidkey.rs::test_pid_zero", "tests/acceptance_pidkey.rs::test_pid_one", "tests/acceptance_pidkey.rs::test_pid_1000", "tests/acceptance_pidkey.rs::test_pid_65535", "tests/acceptance_pidkey.rs::test_pid_4194304", "tests/acceptance_pidkey.rs::test_pid_max"],
+    "AC5": ["tests/acceptance_idempotent.rs::test_load_idempotent", "tests/acceptance_idempotent.rs::test_unload_idempotent", "tests/acceptance_idempotent.rs::test_load_then_unload"],
+    "AC6": ["tests/acceptance_help.rs::test_reference_py_exists", "tests/acceptance_help.rs::test_readme_exists", "tests/acceptance_help.rs::test_readme_mentions_bpolicy_obj"],
+    "AC7": ["cargo clippy --workspace -- -D warnings", "cargo test --workspace"],
+    "AC8": ["tests/mocks/ac8.rs::test_build_sh_exists_and_executable", "tests/mocks/ac8.rs::test_bpf_source_exists", "tests/mocks/ac8.rs::test_vmlinux_h_exists"]
+  }
+}

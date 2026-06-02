@@ -1,0 +1,123 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-warden-home.md",
+  "intent_slug": "bpolicy",
+  "root_motivation": "bpolicy is the only one of the eight local agent-safety tools without a source-controlled home, tests, or a reproducible build. Every other tool tier (memlog, provfs, agentns) has a ~/wintermute/<slug>/ repo. The two follow-on PRDs (warden-policy, warden-deadman) cannot land because there is no tested, versioned base to extend. This PRD creates that home — same CLI surface, same JSON output, new Rust binary, harness — so the rest of the warden fleet has something to test against and diff.",
+  "user_persona": "jsy — running this laptop's agent-safety stack. Uses bpolicy to enforce write restrictions on Claude agent PIDs. Consumes bpolicy status JSON in drift skill and CLAUDE_SELF.md. Expects back-compat with the existing Python CLI surface byte-for-byte.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing",
+    "lower_is_better": false,
+    "harness_command": "cargo test --workspace 2>&1 | tail -5",
+    "target": 8
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "bpolicy --help lists exactly six subcommands: load, unload, enforce, release, status, log. A test asserts each appears.",
+      "test": "tests/acceptance_help.rs::test_help_lists_six_subcommands"
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "bpolicy status with no BPF loaded prints exactly {\"loaded\": false} (the same as Python). A golden test compares against the Python reference output.",
+      "test": "tests/acceptance_status_shape.rs::test_status_not_loaded_json"
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "When loaded (mocked: fixture faking bpftool -j map dump output), status produces the documented shape with protected_pids sorted ascending and stats keyed checked/allowed/denied/forked_in.",
+      "test": "tests/acceptance_status_shape.rs::test_status_loaded_shape"
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "enforce/release translate a PID to the same little-endian u32 key bytes the Python pid_to_key_bytes produces. Unit test asserts for PID 0, 1, 65535, 4194304.",
+      "test": "tests/acceptance_pidkey.rs::test_pid_to_key_bytes"
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "load and unload are idempotent: second load prints {\"already_loaded\": true}; second unload prints {\"already_unloaded\": true}. Tested against a mock pin-exists check.",
+      "test": "tests/acceptance_idempotent.rs::test_load_idempotent and test_unload_idempotent"
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "reference/bpolicy.py is present and README documents the behavioral contract and the BPOLICY_OBJ override.",
+      "test": "tests/acceptance_help.rs::test_reference_py_exists and test_readme_exists"
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "cargo clippy -D warnings and cargo test are green (MSRV 1.85, no let-chains). Privileged paths (sudo -n bpftool) isolated in bpf.rs behind a trait so tests inject a mock and never invoke sudo.",
+      "test": "cargo clippy --workspace -- -D warnings && cargo test --workspace"
+    },
+    {
+      "id": "AC8",
+      "level": "SHOULD",
+      "description": "bpf/build.sh compiles bpf/bpolicy.bpf.c to bpolicy.bpf.o. Deferred if no clang/bpftool in build env — declared as deferred AC.",
+      "test": "tests/mocks/ac8.rs::test_build_sh_exists_and_executable (deferred: real compile skipped if clang absent)"
+    }
+  ],
+  "scope": [
+    "Rust CLI binary at ~/wintermute/bpolicy/ replacing the Python bpolicy script",
+    "Same six subcommands: load, unload, enforce, release, status, log",
+    "Byte-identical JSON output to the Python reference implementation",
+    "BPF source vendored into bpf/ directory unchanged from ~/.local/src/bpolicy/",
+    "Test harness with mocked bpftool subprocess so tests never invoke sudo",
+    "reference/bpolicy.py kept for diffing and documentation"
+  ],
+  "non_goals": [
+    "No BPF behavior change — .bpf.c vendored verbatim",
+    "No loading the enforcer as part of this PRD — home and harness only, arming is user's call",
+    "No hardcoded allow-list changes — warden-policy handles that",
+    "No deadman logic — warden-deadman handles that",
+    "No service/daemon — this is a CLI only",
+    "No automatic install replacing ~/.local/bin/bpolicy — install is manual per README"
+  ],
+  "hard_constraints": {
+    "rust_edition": "2021",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 8,
+    "msrv": "1.85",
+    "additional": {
+      "no_network_in_tests": "tests must never invoke sudo or bpftool; all privileged ops mocked via trait",
+      "back_compat": "JSON output must be byte-identical to the Python reference for status subcommand"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why create a Rust replacement for the Python bpolicy script?",
+      "a": "The Python script has no source-controlled home, no tests, no reproducible build — it is the only one of eight agent-safety tools that cannot be diffed or regression-tested."
+    },
+    {
+      "why": 2,
+      "q": "Why does it need source control and tests specifically?",
+      "a": "The two follow-on PRDs (warden-policy, warden-deadman) are rust-extend into this repo. They have nowhere to land and nothing to test against until the home + harness exist."
+    },
+    {
+      "why": 3,
+      "q": "Why must the JSON output be byte-identical to the Python?",
+      "a": "The drift skill and CLAUDE_SELF.md already cite bpolicy status output; any shape change silently breaks a skill. This PRD makes 'same surface, new home' an explicit tested invariant."
+    },
+    {
+      "why": 4,
+      "q": "Why Rust specifically rather than just version-controlling the Python?",
+      "a": "The wintermute-home rule (memory feedback_wintermute_home) requires Rust CLIs built for this system to live at ~/wintermute/<slug>/. The follow-on warden-policy and warden-deadman PRDs are Rust-extend; they need a Rust base. Additionally, the other seven tools are already Rust."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "Should the installed binary replace ~/.local/bin/bpolicy automatically?",
+      "resolution": "No. The PRD explicitly says install is manual: 'install -m755 target/release/bpolicy ~/.local/bin/bpolicy'. The README documents this step."
+    },
+    {
+      "question": "What is the BPOLICY_OBJ env override for?",
+      "resolution": "The installed binary reads the BPF object from ~/.local/src/bpolicy/ by default (so existing pinned paths are not stranded). BPOLICY_OBJ overrides to point at the repo copy during development."
+    }
+  ],
+  "created_at": "2026-06-02T08:00:00Z"
+}
