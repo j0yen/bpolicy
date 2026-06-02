@@ -82,6 +82,17 @@ struct {
     __type(value, __u8);
 } allowlist SEC(".maps");
 
+// Per-cpu scratch for the candidate allowlist key. struct allowlist_key is
+// 256 bytes; combined with the 256-byte d_path buffer in file_open_check it
+// blows the 512-byte BPF stack limit. Keep it off the stack in a per-cpu
+// ARRAY map (one slot, indexed by 0). Per-cpu means no cross-CPU contention.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct allowlist_key);
+} key_scratch SEC(".maps");
+
 // stat indices
 #define S_CHECKED   0
 #define S_ALLOWED   1
@@ -162,8 +173,19 @@ static __always_inline int path_allowed_defaults(const char *p)
 // on the first separator match. Documented per PRD note on cost.
 static __always_inline int path_allowed_dynamic(const char *path, int pathlen)
 {
-    struct allowlist_key k = {};
+    __u32 zero = 0;
     int i;
+
+    // Candidate key lives in a per-cpu scratch map, NOT on the stack — a
+    // stack-resident struct allowlist_key (256 B) plus the 256 B d_path buffer
+    // exceeds the 512 B BPF stack limit. See key_scratch above.
+    struct allowlist_key *k = bpf_map_lookup_elem(&key_scratch, &zero);
+    if (!k)
+        return 0;
+
+    // Zero the whole key once up front so unused tail bytes never carry stale
+    // per-cpu data into the hash lookup (HASH map compares the full key).
+    __builtin_memset(k, 0, sizeof(*k));
 
     // Walk the path, checking each prefix ending at a '/' boundary or end-of-string.
     // We cap at ALLOWLIST_MAX_PREFIX iterations to satisfy the BPF verifier.
@@ -178,17 +200,19 @@ static __always_inline int path_allowed_dynamic(const char *path, int pathlen)
             continue;
 
         // Build a candidate key: prefix = path[0..i]
-        k.len = (__u8)i;
-        // Copy path[0..i] into k.data (bounded copy, verifier-safe)
+        k->len = (__u8)i;
+        // Copy path[0..i] into k->data (bounded copy, verifier-safe).
+        // Bytes >= i stay zero from the memset / previous shorter prefixes
+        // (each iteration only ever grows i, so we re-zero the gap below).
         #pragma unroll
         for (int j = 0; j < ALLOWLIST_MAX_PREFIX; j++) {
             if (j < i)
-                k.data[j] = path[j];
+                k->data[j] = path[j];
             else
-                k.data[j] = 0;
+                k->data[j] = 0;
         }
 
-        __u8 *hit = bpf_map_lookup_elem(&allowlist, &k);
+        __u8 *hit = bpf_map_lookup_elem(&allowlist, k);
         if (hit)
             return 1;
     }
