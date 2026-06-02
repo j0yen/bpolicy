@@ -1,6 +1,6 @@
 //! bpolicy — userspace control-plane CLI for the BPF-LSM `file_open` enforcer.
 //!
-//! Subcommands: load, unload, enforce, release, status, log, policy
+//! Subcommands: load, unload, enforce, release, status, log, policy, renew
 //!
 //! All privileged operations (`sudo -n bpftool …`) are isolated in [`bpolicy::bpf`]
 //! behind the [`bpolicy::bpf::BpfOps`] trait so tests can inject a mock without
@@ -9,7 +9,8 @@
 #![allow(clippy::print_stderr)] // CLI entry-point: stderr for fatal errors is intentional
 
 use anyhow::Result;
-use bpolicy::bpf::{self, BpfOps, SystemBpf};
+use bpolicy::bpf::{self, BpfOps, LoadOpts, SystemBpf};
+use bpolicy::deadman::{SystemClock, SystemdWatchdog, DEFAULT_TTL_SECS, TTL_PERMANENT};
 use bpolicy::policy;
 use bpolicy::status;
 use clap::{Parser, Subcommand};
@@ -34,6 +35,18 @@ pub enum Commands {
         /// Use `bpolicy policy show` to inspect what prefixes a profile adds.
         #[arg(long)]
         profile: Option<String>,
+        /// Enable audit mode: evaluate but never block (log/count only).
+        /// Audit mode never prompts (it blocks nothing).
+        #[arg(long)]
+        audit: bool,
+        /// Deadman TTL in seconds (0 = permanent arm; default = 1800 = 30m).
+        /// A bare `load` defaults to 30m so a bad arm self-heals.
+        #[arg(long, default_value_t = DEFAULT_TTL_SECS)]
+        ttl: u64,
+        /// Proceed with an enforce-mode arm without the interactive confirmation.
+        /// Required for an enforce arm on a TTY; headless callers should pass it.
+        #[arg(long)]
+        yes: bool,
     },
     /// Detach and remove all pins under `/sys/fs/bpf/bpolicy`.
     Unload,
@@ -63,6 +76,15 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
+    /// Renew the deadman timer, pushing `expires_at` forward.
+    ///
+    /// Call periodically to keep the enforcer alive. If the timer expires
+    /// without a `renew`, `bpolicy unload` is called automatically.
+    Renew {
+        /// New TTL in seconds (0 = keep existing TTL).
+        #[arg(long, default_value_t = 0)]
+        ttl: u64,
+    },
 }
 
 /// Sub-subcommands for `bpolicy policy`.
@@ -85,10 +107,27 @@ pub enum PolicyCmd {
 }
 
 fn run(ops: &dyn BpfOps) -> Result<()> {
+    let clock = SystemClock;
+    let watchdog = SystemdWatchdog;
     let cli = Cli::parse();
     match cli.command {
-        Commands::Load { profile } => bpf::cmd_load(ops, profile.as_deref()),
-        Commands::Unload => bpf::cmd_unload(ops),
+        Commands::Load {
+            profile,
+            audit,
+            ttl,
+            yes,
+        } => {
+            let load_opts = LoadOpts {
+                profile_name: profile.as_deref(),
+                audit,
+                ttl_secs: ttl,
+                assume_yes: yes,
+                clock: &clock,
+                watchdog: &watchdog,
+            };
+            bpf::cmd_load(ops, &load_opts)
+        }
+        Commands::Unload => bpf::cmd_unload(ops, &watchdog),
         Commands::Enforce { pid } => bpf::cmd_enforce(ops, &pid),
         Commands::Release { pid } => bpf::cmd_release(ops, &pid),
         Commands::Status => status::cmd_status(ops),
@@ -99,6 +138,10 @@ fn run(ops: &dyn BpfOps) -> Result<()> {
                 policy::cmd_policy_check(&path, profile.as_deref())
             }
         },
+        Commands::Renew { ttl } => {
+            let ttl_opt = if ttl == TTL_PERMANENT { None } else { Some(ttl) };
+            bpolicy::deadman::renew(ttl_opt, &clock, &watchdog)
+        }
     }
 }
 

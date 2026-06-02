@@ -77,6 +77,15 @@ impl BpfOps for MockBpf {
         Ok(())
     }
 
+    fn map_update_kv(
+        &self,
+        _pinned: &str,
+        _key_bytes: &[String],
+        _val_bytes: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn map_delete(&self, _pinned: &str, key_bytes: &[String]) -> Result<()> {
         self.deleted_keys.borrow_mut().push(key_bytes.to_vec());
         Ok(())
