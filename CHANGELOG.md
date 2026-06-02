@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.0 — 2026-06-02
+
+warden-deadman — arming the enforcer cannot strand you
+
+Adds two blast-radius controls so `bpolicy load` stops being a cliff:
+
+- **Audit mode (`--audit`)**: a `bpolicy_config` BPF map (`mode` field) the
+  `file_open` hook reads. In audit mode it runs the same allow/deny evaluation
+  and bumps `stats.denied`, but returns 0 (allow) — watch what a profile would
+  deny against a live workload without blocking a single write. `status` reports
+  `"mode": "audit" | "enforce"` (additive; absent ⇒ enforce).
+- **Deadman timer (`--ttl`, `renew`)**: `load --ttl <secs>` records expiry in
+  `~/.config/bpolicy/deadman.json` and arms a `systemd-run --user` transient
+  unit that auto-runs `bpolicy unload` at expiry. `renew` pushes expiry forward
+  and re-arms (one live watchdog); `unload` cancels it. A bare `load` defaults
+  to 30m; `--ttl 0` arms permanently (`status` shows `ttl_remaining_s: null`).
+- **Safety interlock (`--yes`)**: an enforce-mode arm on an interactive TTY
+  refuses without `--yes`, printing the would-deny summary + TTL. Audit never
+  prompts; headless callers pass `--yes`.
+
+Coexists with warden-policy's `--profile` allow-list (load populates the
+allowlist map, applies the audit mode, then arms the deadman). The BPF config
+map is named `bpolicy_config` to avoid a vmlinux.h `config` typedef collision.
+Clock/watchdog are injected so timer logic is unit-tested with no real sleeps.
+
 ## v0.2.1 — 2026-06-02
 
 Bugfix: the v0.2.0 BPF object never compiled — `bpf/bpolicy.bpf.c` exceeded
