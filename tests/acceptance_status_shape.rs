@@ -34,7 +34,7 @@ fn test_status_loaded_shape() {
         {"formatted": {"key": 3, "value": 3}}
     ]"#;
 
-    let out = assemble_status(pids_raw, stats_raw);
+    let out = assemble_status(pids_raw, stats_raw, "");
 
     // loaded: true
     assert_eq!(out["loaded"], json!(true));
@@ -60,7 +60,7 @@ fn test_status_loaded_shape() {
 
 #[test]
 fn test_status_loaded_empty_maps() {
-    let out = assemble_status("[]", "[]");
+    let out = assemble_status("[]", "[]", "");
     assert_eq!(out["loaded"], json!(true));
     assert_eq!(out["protected_pids"].as_array().map(Vec::len), Some(0));
 }

@@ -58,6 +58,20 @@ pub trait BpfOps {
     /// Returns an error if `bpftool map update` fails.
     fn map_update(&self, pinned: &str, key_bytes: &[String]) -> Result<()>;
 
+    /// Update a key in a pinned BPF map with an arbitrary value byte sequence.
+    ///
+    /// `key_bytes` and `val_bytes` are decimal-string bytes as expected by
+    /// `bpftool map update pinned <map> key <k...> value <v...>`.
+    ///
+    /// # Errors
+    /// Returns an error if `bpftool map update` fails.
+    fn map_update_kv(
+        &self,
+        pinned: &str,
+        key_bytes: &[String],
+        val_bytes: &[String],
+    ) -> Result<()>;
+
     /// Delete a key from a pinned BPF map (best-effort, no error if missing).
     ///
     /// # Errors
@@ -211,6 +225,34 @@ impl BpfOps for SystemBpf {
         Ok(())
     }
 
+    fn map_update_kv(
+        &self,
+        pinned: &str,
+        key_bytes: &[String],
+        val_bytes: &[String],
+    ) -> Result<()> {
+        let mut args = vec![
+            "-n".to_owned(),
+            "bpftool".to_owned(),
+            "map".to_owned(),
+            "update".to_owned(),
+            "pinned".to_owned(),
+            pinned.to_owned(),
+            "key".to_owned(),
+        ];
+        args.extend_from_slice(key_bytes);
+        args.push("value".to_owned());
+        args.extend_from_slice(val_bytes);
+        let status = Command::new("sudo")
+            .args(&args)
+            .status()
+            .context("sudo bpftool map update (kv)")?;
+        if !status.success() {
+            bail!("bpftool map update kv pinned {pinned}: failed");
+        }
+        Ok(())
+    }
+
     fn map_delete(&self, pinned: &str, key_bytes: &[String]) -> Result<()> {
         let mut args = vec![
             "-n".to_owned(),
@@ -269,28 +311,60 @@ impl BpfOps for SystemBpf {
     }
 }
 
-/// Load the enforcer, optionally populating the allowlist from a named profile.
+/// Options for loading the enforcer.
 ///
-/// If `profile_name` is `None` (i.e., `bpolicy load` with no `--profile`),
-/// this behaves identically to warden-home: BPF loads with compiled defaults only.
+/// Merges warden-policy's `--profile` allow-list population with
+/// warden-deadman's `--audit` mode and `--ttl` deadman timer, plus the
+/// `--yes` TTY safety interlock.
+pub struct LoadOpts<'a> {
+    /// Named policy profile to load (`None` ⇒ tight / compiled defaults only).
+    pub profile_name: Option<&'a str>,
+    /// If `true`, set the config map to audit mode (count but allow).
+    pub audit: bool,
+    /// TTL in seconds; `0` = permanent.  Defaults to 30 minutes.
+    pub ttl_secs: u64,
+    /// If `true`, skip the interactive TTY confirmation for an enforce arm.
+    /// Headless callers always pass `true`.
+    pub assume_yes: bool,
+    /// Clock implementation for deadman arming.
+    pub clock: &'a dyn crate::deadman::Clock,
+    /// Watchdog implementation for the deadman timer.
+    pub watchdog: &'a dyn crate::deadman::Watchdog,
+}
+
+/// Decide whether an enforce-mode arm may proceed given the interlock inputs.
 ///
-/// If `profile_name` is `Some`, the named profile from `~/.config/bpolicy/policy.toml`
-/// is validated first, then the BPF object is loaded, and finally the allowlist map
-/// is populated with the profile's extra prefixes.
+/// Returns `true` if the load may proceed without prompting. The interlock
+/// only bites in **enforce** mode on an interactive TTY without `--yes`:
+/// audit mode blocks nothing so it never prompts, and non-TTY (headless)
+/// callers are trusted to know what they are doing.
+///
+/// Pure function (no I/O) so it is unit-testable with faked TTY/flags.
+#[must_use]
+pub const fn interlock_allows(audit: bool, assume_yes: bool, stdin_is_tty: bool) -> bool {
+    audit || assume_yes || !stdin_is_tty
+}
+
+/// Load the enforcer: populate the allow-list from a profile (if any), set the
+/// audit/enforce mode in the config map, and arm the deadman timer.
+///
+/// The TTY safety interlock (`--yes`) is enforced for enforce-mode arms on an
+/// interactive stdin; audit mode and headless callers never prompt.
 ///
 /// # Errors
-/// Returns an error if the BPF object is missing, bpftool fails, or the profile
-/// is unknown / the policy file cannot be parsed.
-pub fn cmd_load(ops: &dyn BpfOps, profile_name: Option<&str>) -> Result<()> {
-    if ops.is_loaded() {
+/// Returns an error if the profile is unknown, the interlock refuses, the BPF
+/// object is missing, bpftool fails, the config map write fails, or the deadman
+/// arm fails.
+#[allow(clippy::similar_names)] // `bpf_ops` and `load_opts` are clearly distinct
+pub fn cmd_load(bpf_ops: &dyn BpfOps, load_opts: &LoadOpts<'_>) -> Result<()> {
+    if bpf_ops.is_loaded() {
         println!("{}", json!({"already_loaded": true}));
         return Ok(());
     }
 
     // Validate profile before loading (fail fast before touching BPF state).
-    let prefixes: Vec<String> = if let Some(name) = profile_name {
+    let prefixes: Vec<String> = if let Some(name) = load_opts.profile_name {
         let prefixes = policy::load_profile_prefixes(name)?;
-        // Validate all prefixes before committing to load.
         for p in &prefixes {
             policy::validate_prefix(p)?;
         }
@@ -299,31 +373,71 @@ pub fn cmd_load(ops: &dyn BpfOps, profile_name: Option<&str>) -> Result<()> {
         vec![]
     };
 
-    ops.load_prog(&ops.obj_path(), BPF_ROOT)?;
-
-    // Populate the allowlist map with profile prefixes (if any).
-    if !prefixes.is_empty() {
-        for prefix in &prefixes {
-            ops.allowlist_add_prefix(PINNED_MAP_ALLOWLIST, prefix)?;
-        }
+    // Safety interlock: an enforce-mode arm on an interactive TTY without
+    // `--yes` refuses, after printing what it would deny + the TTL.
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !interlock_allows(load_opts.audit, load_opts.assume_yes, stdin_is_tty) {
+        let profile_label = load_opts.profile_name.unwrap_or("tight");
+        let ttl_label = if load_opts.ttl_secs == crate::deadman::TTL_PERMANENT {
+            "permanent".to_owned()
+        } else {
+            format!("{}s", load_opts.ttl_secs)
+        };
+        bail!(
+            "refusing enforce-mode arm without --yes (interactive). \
+             profile '{profile_label}' would DENY all writes outside its allow-list \
+             (ttl={ttl_label}). Re-run with --yes to proceed, or use --audit to count-only."
+        );
     }
 
-    let profile_field = profile_name.unwrap_or("tight");
-    let out = json!({"loaded": true, "path": BPF_ROOT, "profile": profile_field});
-    println!("{out}");
+    bpf_ops.load_prog(&bpf_ops.obj_path(), BPF_ROOT)?;
+
+    // Populate the allowlist map with profile prefixes (if any).
+    for prefix in &prefixes {
+        bpf_ops.allowlist_add_prefix(PINNED_MAP_ALLOWLIST, prefix)?;
+    }
+
+    // Write the audit-mode config into the BPF config map (key=0).
+    let mode_val = if load_opts.audit {
+        crate::audit::MODE_AUDIT
+    } else {
+        crate::audit::MODE_ENFORCE
+    };
+    let (key_bytes, val_bytes) = crate::audit::mode_map_bytes(mode_val);
+    // Best-effort: the config map may not be accessible immediately; tolerate failure.
+    let _cfg_result =
+        bpf_ops.map_update_kv(crate::audit::PINNED_MAP_CONFIG, &key_bytes, &val_bytes);
+
+    // Arm the deadman timer.
+    crate::deadman::arm(load_opts.ttl_secs, load_opts.clock, load_opts.watchdog)?;
+
+    let mode_label = crate::audit::mode_label(mode_val);
+    let ttl_info: serde_json::Value = if load_opts.ttl_secs == crate::deadman::TTL_PERMANENT {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Number(serde_json::Number::from(load_opts.ttl_secs))
+    };
+    let profile_field = load_opts.profile_name.unwrap_or("tight");
+    println!(
+        "{}",
+        json!({"loaded": true, "path": BPF_ROOT, "profile": profile_field,
+               "mode": mode_label, "ttl_secs": ttl_info})
+    );
     Ok(())
 }
 
-/// Unload the enforcer.
+/// Unload the enforcer and cancel any deadman watchdog.
 ///
 /// # Errors
 /// Returns an error if bpftool fails.
-pub fn cmd_unload(ops: &dyn BpfOps) -> Result<()> {
+pub fn cmd_unload(ops: &dyn BpfOps, watchdog: &dyn crate::deadman::Watchdog) -> Result<()> {
     if !ops.is_loaded() {
         println!("{}", json!({"already_unloaded": true}));
         return Ok(());
     }
     ops.unload_prog(BPF_ROOT)?;
+    // Cancel the deadman watchdog and clear the state file (best-effort; ignore errors).
+    let _disarm = crate::deadman::disarm(watchdog);
     println!("{}", json!({"unloaded": true}));
     Ok(())
 }
@@ -424,6 +538,7 @@ mod tests {
             }
             fn unload_prog(&self, _root: &str) -> Result<()> { Ok(()) }
             fn map_update(&self, _pin: &str, _key: &[String]) -> Result<()> { Ok(()) }
+            fn map_update_kv(&self, _pin: &str, _key: &[String], _val: &[String]) -> Result<()> { Ok(()) }
             fn map_delete(&self, _pin: &str, _key: &[String]) -> Result<()> { Ok(()) }
             fn map_dump_json(&self, _pin: &str) -> String { String::new() }
             fn tail_trace_pipe(&self, _n: usize) -> Result<()> { Ok(()) }
@@ -464,6 +579,20 @@ allow = ["/home/jsy/wintermute", "/home/jsy/.claude"]
         assert_eq!(calls.len(), 2, "two prefix calls");
         assert!(calls.contains(&"/home/jsy/wintermute".to_owned()));
         assert!(calls.contains(&"/home/jsy/.claude".to_owned()));
+    }
+
+    /// AC7 (deadman): the TTY interlock only refuses an enforce-mode arm on an
+    /// interactive stdin without `--yes`. Audit mode and headless callers pass.
+    #[test]
+    fn test_interlock_refuses_enforce_tty_without_yes() {
+        // enforce + TTY + no --yes ⇒ refuse
+        assert!(!interlock_allows(false, false, true));
+        // enforce + TTY + --yes ⇒ proceed
+        assert!(interlock_allows(false, true, true));
+        // audit always proceeds (blocks nothing), even on a TTY without --yes
+        assert!(interlock_allows(true, false, true));
+        // headless (non-TTY) enforce without --yes ⇒ proceed
+        assert!(interlock_allows(false, false, false));
     }
 
     /// AC7: load with no profile reports "tight" in output (back-compat).

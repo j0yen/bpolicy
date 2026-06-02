@@ -33,6 +33,10 @@
 // Userspace mirror: src/policy.rs:prefix_matches / is_allowed.
 // Any change to this spec MUST be reflected in policy.rs, and vice-versa.
 //
+// Config map (index 0 — mode):
+//   0 = enforce (default): deny writes outside allow-list
+//   1 = audit:  evaluate but always return 0 (allow); counts still increment
+//
 // Compile:  clang -O2 -g -target bpf -I. -c bpolicy.bpf.c -o bpolicy.bpf.o
 // Load:     sudo bpftool prog loadall bpolicy.bpf.o /sys/fs/bpf/bpolicy autoattach
 
@@ -92,6 +96,23 @@ struct {
     __type(key, __u32);
     __type(value, struct allowlist_key);
 } key_scratch SEC(".maps");
+
+// Config map — single entry at key=0.
+// Value layout: u64, low byte = mode (0=enforce, 1=audit).
+// Named `bpolicy_config` (not `config`) to avoid colliding with the
+// `typedef struct config_s config;` present in some kernels' vmlinux.h.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} bpolicy_config SEC(".maps");
+
+// Config key for the mode field
+#define CFG_KEY_MODE 0
+// Mode values
+#define MODE_ENFORCE 0
+#define MODE_AUDIT   1
 
 // stat indices
 #define S_CHECKED   0
@@ -260,5 +281,12 @@ int BPF_PROG(file_open_check, struct file *file, int ret)
 
     bump(S_DENIED);
     bpf_printk("bpolicy: block pid=%d path=%s\n", pid, buf);
+
+    // Audit mode: count but allow
+    __u32 cfg_key = CFG_KEY_MODE;
+    __u64 *mode_v = bpf_map_lookup_elem(&bpolicy_config, &cfg_key);
+    if (mode_v && (*mode_v & 0xFF) == MODE_AUDIT)
+        return 0;
+
     return -EPERM;
 }
