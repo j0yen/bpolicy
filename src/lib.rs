@@ -3,6 +3,7 @@
 pub mod audit;
 pub mod bpf;
 pub mod deadman;
+pub mod doctor;
 pub mod pids;
 pub mod policy;
 pub mod status;

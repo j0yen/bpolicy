@@ -1,6 +1,6 @@
 //! bpolicy — userspace control-plane CLI for the BPF-LSM `file_open` enforcer.
 //!
-//! Subcommands: load, unload, enforce, release, status, log, policy, renew
+//! Subcommands: load, unload, enforce, release, status, log, policy, renew, doctor
 //!
 //! All privileged operations (`sudo -n bpftool …`) are isolated in [`bpolicy::bpf`]
 //! behind the [`bpolicy::bpf::BpfOps`] trait so tests can inject a mock without
@@ -11,6 +11,7 @@
 use anyhow::Result;
 use bpolicy::bpf::{self, BpfOps, LoadOpts, SystemBpf};
 use bpolicy::deadman::{SystemClock, SystemdWatchdog, DEFAULT_TTL_SECS, TTL_PERMANENT};
+use bpolicy::doctor::{self, DoctorFormat};
 use bpolicy::policy;
 use bpolicy::status;
 use clap::{Parser, Subcommand};
@@ -85,6 +86,20 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         ttl: u64,
     },
+    /// Diagnose why the enforcer may be inert (read-only, never arms anything).
+    ///
+    /// Probes each precondition for the LSM enforcer to be armed and reports
+    /// each as `ok | gap | unknown` with the observed value.  Use this when
+    /// `bpolicy status` shows `"loaded": false` and you need to know *why*.
+    Doctor {
+        /// Output format: human (default), json, or docket.
+        ///
+        /// - `human` — one line per check (name, verdict, detail).
+        /// - `json`  — JSON object keyed by check name; suitable for scripts.
+        /// - `docket` — single `docket report` command for the first gap.
+        #[arg(long, default_value = "human")]
+        format: DoctorFormat,
+    },
 }
 
 /// Sub-subcommands for `bpolicy policy`.
@@ -142,10 +157,19 @@ fn run(ops: &dyn BpfOps) -> Result<()> {
             let ttl_opt = if ttl == TTL_PERMANENT { None } else { Some(ttl) };
             bpolicy::deadman::renew(ttl_opt, &clock, &watchdog)
         }
+        Commands::Doctor { format } => doctor::cmd_doctor(format),
     }
 }
 
 fn main() {
+    // Reset SIGPIPE to default so broken-pipe (`bpolicy doctor | head`) exits
+    // cleanly instead of panicking.  SAFETY: single-threaded at this point;
+    // no signal handlers are registered yet.
+    #[allow(unsafe_code)]
+    // SAFETY: called before any threads are spawned; no other signal handlers set.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let ops = SystemBpf::new();
     if let Err(e) = run(&ops) {
         eprintln!("bpolicy: {e}");
